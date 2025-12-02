@@ -162,16 +162,16 @@ if authenticate_user():
     with st.container():
         prompt = st.text_area("プロンプトを入力", height=100)
         brighten = st.checkbox("☀️ 明るく補正", value=True)
-        generate_btn = st.button("🚀 画像を作成 & 記録")
+        generate_btn = st.button("🚀 画像を作成")
 
     if generate_btn and prompt:
-        with st.spinner("AIが描画中... ドライブと管理表に保存します..."):
+        with st.spinner("AIが描画中..."):
             img_bytes = generate_image(prompt, brighten)
             
             if img_bytes:
                 st.image(Image.open(io.BytesIO(img_bytes)), caption="生成結果", use_container_width=True)
                 
                 if save_data(img_bytes, prompt, user):
-                    st.success(f"✅ 保存完了！スプレッドシートに記録しました (担当: {user})")
+                    st.success(f"✅ 保存完了！(担当: {user})")
                 
                 st.download_button("📥 ダウンロード", data=img_bytes, file_name="image.png", mime="image/png")
