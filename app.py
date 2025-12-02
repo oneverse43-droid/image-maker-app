@@ -5,10 +5,9 @@ import base64
 import tempfile
 import datetime
 import io
-import csv
 from PIL import Image
 
-# Vertex AI & Google Drive Libraries
+# Vertex AI & Google APIs
 import vertexai
 from vertexai.preview.vision_models import ImageGenerationModel
 from google.oauth2 import service_account
@@ -31,7 +30,6 @@ st.markdown("""
 
 # --- 認証 & サービスアカウント準備 ---
 def get_service_account_info():
-    """SecretsからJSON文字列を読み込み、辞書として返す"""
     try:
         json_str = st.secrets["gcp"]["service_account_json"]
         return json.loads(json_str)
@@ -40,7 +38,6 @@ def get_service_account_info():
         return None
 
 def authenticate_user():
-    """ユーザーログイン処理"""
     if "logged_in_user" not in st.session_state:
         st.session_state.logged_in_user = None
 
@@ -48,13 +45,10 @@ def authenticate_user():
         return True
 
     st.markdown("### 🔒 ログインしてください")
-    
-    # ユーザーリストをSecretsから取得
     users = st.secrets["app_users"]
-    
     col1, col2 = st.columns(2)
     with col1:
-        username = st.text_input("ユーザー名 (例: sato)")
+        username = st.text_input("ユーザー名")
     with col2:
         password = st.text_input("パスワード", type="password")
 
@@ -64,86 +58,68 @@ def authenticate_user():
             st.success(f"ようこそ、{username} さん！")
             st.rerun()
         else:
-            st.error("ユーザー名かパスワードが違います")
+            st.error("認証失敗")
     return False
 
-# --- Google Drive 連携 ---
-def save_to_drive(image_bytes, prompt, username):
-    """画像をドライブに保存し、ログを更新する"""
+# --- Google Drive & Sheets 連携 ---
+def save_data(image_bytes, prompt, username):
+    """
+    1. 画像をDrive(共有ドライブ)に保存
+    2. ログをSpreadsheetに追記
+    """
     try:
         creds_info = get_service_account_info()
-        creds = service_account.Credentials.from_service_account_info(
-            creds_info, scopes=['https://www.googleapis.com/auth/drive']
-        )
-        service = build('drive', 'v3', credentials=creds)
+        # DriveとSheets両方の権限を持たせる
+        scopes = [
+            'https://www.googleapis.com/auth/drive',
+            'https://www.googleapis.com/auth/spreadsheets'
+        ]
+        creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
+        
+        # --- 1. Driveに画像を保存 ---
+        drive_service = build('drive', 'v3', credentials=creds)
         folder_id = st.secrets["app_settings"]["drive_folder_id"]
+        
+        now = datetime.datetime.now()
+        timestamp_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        file_name = f"{now.strftime('%Y%m%d_%H%M%S')}_{username}.png"
 
-        # 1. 画像ファイル名を作成 (日時_ユーザー名.png)
-        now_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        file_name = f"{now_str}_{username}.png"
-
-        # 2. 画像をアップロード
         file_metadata = {'name': file_name, 'parents': [folder_id]}
         media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype='image/png')
-        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
         
-        # 3. ログファイル (usage_log.csv) を更新
-        update_log_file(service, folder_id, username, prompt, file_name)
+        drive_service.files().create(
+            body=file_metadata, 
+            media_body=media, 
+            supportsAllDrives=True
+        ).execute()
+
+        # --- 2. Spreadsheetにログを追記 ---
+        sheet_service = build('sheets', 'v4', credentials=creds)
+        spreadsheet_id = st.secrets["app_settings"]["spreadsheet_id"]
+        
+        # 書き込むデータ [日時, ユーザー, ファイル名, プロンプト]
+        # 日付を集計しやすいように、A列は "2023/10/01" のような形式で入れます
+        row_data = [[timestamp_str, username, file_name, prompt]]
+        
+        body = {'values': row_data}
+        
+        sheet_service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range="log!A:D",      # "log"というシート名のA列〜D列に追加
+            valueInputOption="USER_ENTERED",
+            body=body
+        ).execute()
         
         return True
+
     except Exception as e:
-        st.error(f"Google Drive保存エラー: {e}")
+        st.error(f"保存エラー: {e}")
         return False
-
-def update_log_file(service, folder_id, username, prompt, image_filename):
-    """Drive上のCSVログに追記する"""
-    log_filename = "usage_log.csv"
-    
-    # 既存のログファイルを探す
-    results = service.files().list(
-        q=f"name='{log_filename}' and '{folder_id}' in parents and trashed=false",
-        fields="files(id, name)").execute()
-    items = results.get('files', [])
-
-    # 今のデータ行
-    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    new_row = [timestamp, username, image_filename, prompt]
-    
-    csv_content = ""
-    file_id = None
-
-    if not items:
-        # 新規作成
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["Timestamp", "User", "ImageFile", "Prompt"]) # ヘッダー
-        writer.writerow(new_row)
-        csv_content = output.getvalue()
-        
-        metadata = {'name': log_filename, 'parents': [folder_id], 'mimeType': 'text/csv'}
-        media = MediaIoBaseUpload(io.BytesIO(csv_content.encode('utf-8')), mimetype='text/csv')
-        service.files().create(body=metadata, media_body=media).execute()
-    else:
-        # 追記 (既存ファイルをダウンロード -> 追記 -> アップデート)
-        file_id = items[0]['id']
-        request = service.files().get_media(fileId=file_id)
-        downloaded = request.execute().decode('utf-8')
-        
-        output = io.StringIO()
-        output.write(downloaded)
-        writer = csv.writer(output)
-        writer.writerow(new_row)
-        csv_content = output.getvalue()
-        
-        media = MediaIoBaseUpload(io.BytesIO(csv_content.encode('utf-8')), mimetype='text/csv')
-        service.files().update(fileId=file_id, media_body=media).execute()
 
 # --- 画像生成 ---
 def generate_image(prompt, brighten_flg):
     try:
         creds_info = get_service_account_info()
-        
-        # Vertex AI 初期化
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as f:
             json.dump(creds_info, f)
             key_path = f.name
@@ -152,7 +128,6 @@ def generate_image(prompt, brighten_flg):
         vertexai.init(project=creds_info["project_id"], location="us-central1")
         model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-002")
         
-        # プロンプト補正
         final_prompt = prompt
         if brighten_flg:
             if "--ar 16:9" in final_prompt:
@@ -187,19 +162,16 @@ if authenticate_user():
     with st.container():
         prompt = st.text_area("プロンプトを入力", height=100)
         brighten = st.checkbox("☀️ 明るく補正", value=True)
-        generate_btn = st.button("🚀 画像を作成 & ドライブ保存")
+        generate_btn = st.button("🚀 画像を作成 & 記録")
 
     if generate_btn and prompt:
-        with st.spinner("AIが描画中... その後ドライブに保存します..."):
+        with st.spinner("AIが描画中... ドライブと管理表に保存します..."):
             img_bytes = generate_image(prompt, brighten)
             
             if img_bytes:
-                # 画面表示
                 st.image(Image.open(io.BytesIO(img_bytes)), caption="生成結果", use_container_width=True)
                 
-                # ドライブ保存 & ログ記録
-                if save_to_drive(img_bytes, prompt, user):
-                    st.success(f"✅ Googleドライブに保存しました！ (担当: {user})")
+                if save_data(img_bytes, prompt, user):
+                    st.success(f"✅ 保存完了！スプレッドシートに記録しました (担当: {user})")
                 
-                # 手元へのダウンロード用
-                st.download_button("📥 今すぐダウンロード", data=img_bytes, file_name="image.png", mime="image/png")
+                st.download_button("📥 ダウンロード", data=img_bytes, file_name="image.png", mime="image/png")
